@@ -9,7 +9,6 @@ Este repositório contém a implementação da **POC 4 - Anti-Platform Throttlin
 * Antônio Rocha Lima Filho
 * Cássio Vittori de Campos Filho
 * João Vitor Teixeira Barreto
-* [NOME DO 5º INTEGRANTE AQUI]
 
 ## 🏗️ Escopo e Arquitetura
 Para garantir o envio de tráfego sem acionar defesas das plataformas, implementaremos:
