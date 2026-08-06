@@ -1,0 +1,270 @@
+# ---------------------------------------------------------------------------
+# Integracao Continua -- Anti-Platform Throttling
+#
+# Quatro jobs, deliberadamente separados em vez de um unico job sequencial:
+#
+#   quality      lint, formatacao e tipagem            (~30s, sem infraestrutura)
+#   unit         117 testes unitarios                  (~30s, sem infraestrutura)
+#   integration  testes contra Postgres/Redis/RabbitMQ (~2min, service containers)
+#   docker       build das imagens + smoke test        (~3min)
+#
+# POR QUE SEPARAR
+#
+# `quality` e `unit` rodam em paralelo e em segundos. Num job unico e sequencial,
+# um erro de formatacao so apareceria depois de subir tres containers e esperar o
+# healthcheck -- feedback lento para o erro mais barato de corrigir.
+#
+# `integration` nao depende de `unit` de proposito: se os dois falharem, queremos
+# ver os DOIS relatorios na mesma execucao, e nao descobrir o segundo problema
+# so depois de corrigir o primeiro.
+# ---------------------------------------------------------------------------
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # Permite disparar manualmente pela aba Actions -- util para revalidar o
+  # pipeline sem precisar de um commit vazio.
+  workflow_dispatch:
+
+# Cancela execucoes anteriores do mesmo branch/PR. Sem isso, tres pushes
+# seguidos deixariam tres pipelines competindo pelos runners e o resultado que
+# importa (o do ultimo commit) sairia por ultimo.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # =========================================================================
+  # Qualidade estatica -- o feedback mais rapido e mais barato
+  # =========================================================================
+  quality:
+    name: Qualidade (lint, formato, tipos)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff check)
+        run: ruff check src tests
+
+      - name: Formatacao (ruff format --check)
+        run: ruff format --check src tests
+
+      - name: Tipagem (mypy)
+        run: mypy
+
+      - name: Vulnerabilidades nas dependencias (pip-audit)
+        # `continue-on-error` de proposito: uma CVE nova publicada numa
+        # dependencia transitiva quebraria o pipeline de um PR que nao tem
+        # nenhuma relacao com ela. Queremos o AVISO visivel, sem bloquear o
+        # trabalho de quem nao causou o problema.
+        continue-on-error: true
+        run: pip-audit --desc
+
+  # =========================================================================
+  # Testes unitarios -- sem infraestrutura, por projeto
+  # =========================================================================
+  unit:
+    name: Testes unitarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Nao precisa de Postgres, Redis nem RabbitMQ. Isso e consequencia de uma
+      # decisao de projeto: a logica critica (token bucket, maquina de estados do
+      # breaker, jitter, backoff) foi escrita como funcao pura, sem I/O e
+      # recebendo o tempo como parametro. Ver src/apt/resilience/token_bucket.py.
+      - name: Rodar testes unitarios
+        run: pytest tests/unit -v --cov=apt --cov-report=term-missing
+
+  # =========================================================================
+  # Testes de integracao -- exigem a infraestrutura
+  # =========================================================================
+  integration:
+    name: Testes de integracao
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: apt
+          POSTGRES_PASSWORD: apt_local_password
+          POSTGRES_DB: apt
+        ports: ["5432:5432"]
+        # Sem healthcheck, os testes comecariam antes de o Postgres aceitar
+        # conexao e falhariam com "connection refused" -- um falso negativo que
+        # parece bug de codigo.
+        options: >-
+          --health-cmd "pg_isready -U apt -d apt"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 15
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: apt
+          RABBITMQ_DEFAULT_PASS: apt_local_password
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_running"
+          --health-interval 10s
+          --health-timeout 10s
+          --health-retries 20
+
+    env:
+      APT_DATABASE_URL: postgresql+asyncpg://apt:apt_local_password@localhost:5432/apt
+      APT_REDIS_URL: redis://localhost:6379/0
+      APT_RABBITMQ_URL: amqp://apt:apt_local_password@localhost:5672/
+      APT_LOG_LEVEL: WARNING
+      APT_LOG_JSON: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          # psql para aplicar o schema (os service containers nao executam
+          # os scripts de /docker-entrypoint-initdb.d).
+          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client
+
+      - name: Aplicar o schema
+        env:
+          PGPASSWORD: apt_local_password
+        run: psql -h localhost -U apt -d apt -v ON_ERROR_STOP=1 -f db/migrations/001_init.sql
+
+      - name: Rodar testes de integracao
+        run: pytest tests/integration -v -m integration
+
+  # =========================================================================
+  # Build das imagens + smoke test do stack completo
+  # =========================================================================
+  docker:
+    name: Build Docker e smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar o .env
+        # O compose exige o arquivo (`env_file: [.env]`). O `.env.example` tem
+        # todos os valores de desenvolvimento e serve para o CI sem alteracao.
+        run: cp .env.example .env
+
+      - name: Subir o stack
+        run: docker compose up -d --build
+
+      - name: Aguardar os servicos ficarem saudaveis
+        run: |
+          echo "aguardando ate 120s pelos healthchecks..."
+          for i in $(seq 1 40); do
+            if curl -fsS http://localhost:8000/health/ready > /dev/null 2>&1 \
+               && curl -fsS http://localhost:9001/health > /dev/null 2>&1; then
+              echo "stack pronto (tentativa $i)"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "ERRO: o stack nao ficou saudavel. Estado dos servicos:"
+          docker compose ps
+          echo "--- logs da api ---";    docker compose logs --tail=60 api
+          echo "--- logs do worker ---"; docker compose logs --tail=60 worker
+          exit 1
+
+      - name: Smoke test do fluxo ponta a ponta
+        # Verifica o caminho completo: a API cria a campanha, o scheduler
+        # materializa as tarefas, o worker consome e envia ao simulador. Se
+        # `sent` continuar zero, algum elo da cadeia esta rompido -- e um build
+        # que sobe mas nao processa nada nao deveria passar no CI.
+        run: |
+          set -euo pipefail
+
+          echo "--- criando uma campanha ---"
+          CAMPAIGN=$(curl -fsS -X POST http://localhost:8000/campaigns \
+            -H 'Content-Type: application/json' \
+            -d @examples/campaign.json)
+          echo "$CAMPAIGN"
+          CAMPAIGN_ID=$(echo "$CAMPAIGN" | python -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+
+          echo "--- aguardando o processamento (25s) ---"
+          sleep 25
+
+          echo "--- status da campanha ---"
+          curl -fsS "http://localhost:8000/campaigns/$CAMPAIGN_ID/status" | python -m json.tool
+
+          echo "--- o que a plataforma observou ---"
+          curl -fsS http://localhost:9001/admin/stats | python -m json.tool
+
+          echo "--- verificando que houve envios aceitos ---"
+          curl -fsS http://localhost:9001/admin/stats | python -c '
+          import sys, json
+          stats = json.load(sys.stdin)
+          total = sum(s["total_accepted"] for s in stats)
+          print(f"total aceito pelas plataformas: {total}")
+          if total == 0:
+              print("ERRO: nenhum envio chegou as plataformas -- a cadeia "
+                    "API -> fila -> worker -> plataforma esta rompida")
+              sys.exit(1)
+          for s in stats:
+              if s["peak_rps"] > s["limit_rps"]:
+                  print(f"ERRO: {s[\"platform\"]} teve pico de {s[\"peak_rps\"]}/s, "
+                        f"acima do limite de {s[\"limit_rps\"]}/s")
+                  sys.exit(1)
+          print("OK: houve envios e nenhum pico passou do limite das plataformas")
+          '
+
+      - name: Logs em caso de falha
+        if: failure()
+        run: |
+          docker compose ps
+          docker compose logs --tail=120
+
+      - name: Derrubar o stack
+        # `always()` garante a limpeza mesmo quando o smoke test falha.
+        if: always()
+        run: docker compose down -v
