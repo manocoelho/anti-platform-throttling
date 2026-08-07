@@ -244,12 +244,9 @@ Plano completo com hipóteses e critérios de aceite em
 | [adr/](docs/adr/) | **12 ADRs** com decisões, alternativas rejeitadas e validação |
 | [PADROES.md](docs/PADROES.md) | Os 6 padrões: onde no código e como demonstrar |
 | [TRADE-OFFS.md](docs/TRADE-OFFS.md) | O custo assumido de cada decisão e as limitações conhecidas |
-| [CODIGO-EXPLICADO.md](docs/CODIGO-EXPLICADO.md) | Arquivo por arquivo + **Q&A antecipado** |
 | [PLANO-DE-TESTES.md](docs/PLANO-DE-TESTES.md) | Cenários, hipóteses e critérios de aceite |
 | [RESULTADOS-TESTES.md](docs/RESULTADOS-TESTES.md) | Números medidos e análise |
 | [ATUALIZACOES-DOC-INICIAL.md](docs/ATUALIZACOES-DOC-INICIAL.md) | O que mudou desde o Projeto 02 e por quê |
-| [ROTEIRO-APRESENTACAO.md](docs/ROTEIRO-APRESENTACAO.md) | Roteiro de 12–15 min dividido entre os 4 integrantes |
-| [PRS-SUGERIDOS.md](docs/PRS-SUGERIDOS.md) | 48 PRs na ordem de merge, com atribuição |
 
 ---
 
