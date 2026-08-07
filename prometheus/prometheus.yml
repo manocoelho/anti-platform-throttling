@@ -1,0 +1,74 @@
+# ---------------------------------------------------------------------------
+# Configuracao do Prometheus para a POC 4.
+#
+# Intervalo de 5s (o padrao e 15s): os testes de carga duram dezenas de
+# segundos, e com 15s de intervalo um teste de 40s renderia tres pontos por
+# serie -- insuficiente para enxergar o comportamento.
+#
+# SOBRE A DESCOBERTA DAS REPLICAS DE WORKER
+#
+# `docker compose up --scale worker=5` cria cinco containers. O DNS interno do
+# Compose resolve o nome do servico (`worker`) para TODOS os IPs das replicas,
+# e por isso usamos `dns_sd_configs` com `type: A`: o Prometheus consulta o DNS,
+# recebe os cinco enderecos e raspa cada um.
+#
+# Com um alvo estatico (`targets: ['worker:9100']`), o Prometheus resolveria o
+# nome UMA vez e raspaparia sempre a mesma replica -- as metricas das outras
+# quatro ficariam invisiveis, e o teste de escala mediria um quinto da realidade.
+# ---------------------------------------------------------------------------
+
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  evaluation_interval: 15s
+  external_labels:
+    project: anti-platform-throttling
+
+scrape_configs:
+  # -------------------------------------------------------------------------
+  # API (inclui as metricas do scheduler, que roda no mesmo processo)
+  # -------------------------------------------------------------------------
+  - job_name: apt-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['api:8000']
+        labels:
+          component: api
+
+  # -------------------------------------------------------------------------
+  # Workers -- descoberta por DNS para acompanhar o --scale
+  # -------------------------------------------------------------------------
+  - job_name: apt-worker
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ['worker']
+        type: A
+        port: 9100
+        refresh_interval: 10s
+    relabel_configs:
+      # O alvo vem como "172.18.0.7:9100". Guardamos o IP como label `replica`
+      # para dar para distinguir as replicas nas consultas -- sem isso, as series
+      # de todas elas se misturariam.
+      - source_labels: [__address__]
+        regex: '([^:]+):.*'
+        target_label: replica
+        replacement: '$1'
+      - target_label: component
+        replacement: worker
+
+  # -------------------------------------------------------------------------
+  # Simulador de plataformas -- o lado "de fora"
+  # -------------------------------------------------------------------------
+  - job_name: apt-platform-sim
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['platform-sim:9001']
+        labels:
+          component: platform-sim
+
+  # -------------------------------------------------------------------------
+  # O proprio Prometheus (util para confirmar que a coleta esta saudavel)
+  # -------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
