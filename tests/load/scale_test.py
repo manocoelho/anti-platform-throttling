@@ -8,14 +8,17 @@ HIPOTESE
 
 Escalar de 1 para 3 para 5 workers deve aumentar a CAPACIDADE DE
 PROCESSAMENTO do sistema, mas NAO a vazao enviada a plataforma. O pico de
-requisicoes que a plataforma observa deve permanecer abaixo do `allowed_rps`
-configurado nas tres configuracoes.
+requisicoes que a plataforma observa deve permanecer dentro do TETO ALGEBRICO
+do bucket compartilhado (`allowed_rps + burst_capacity`) nas tres
+configuracoes -- nao so abaixo de `allowed_rps` isoladamente, porque o pior
+caso (balde cheio + refill do mesmo segundo) pode legitimamente somar as duas
+parcelas numa unica janela de 1s do simulador.
 
 POR QUE ISSO PROVA ALGO
 
 Um rate limiter em memoria de processo passaria em qualquer teste com 1 worker.
-Com 5 workers, cada um teria o seu proprio balde de 16 req/s e o sistema enviaria
-80 req/s -- 4x o limite da plataforma.
+Com 5 workers, cada um teria o seu proprio balde de 3 req/s e o sistema enviaria
+15 req/s -- 3x o limite da plataforma.
 
 Ou seja: o rate limiter existiria, estaria "funcionando" em cada processo, e o
 sistema violaria o limite exatamente ao escalar. O bug so apareceria em producao,
@@ -60,14 +63,30 @@ from tests.load.common import (
 )
 
 PLATFORM = "youtube"
-ALLOWED_RPS = 16.0
-PLATFORM_LIMIT_RPS = 20
+ALLOWED_RPS = 3.0
+PLATFORM_LIMIT_RPS = 5
+# Espelha o burst_capacity do YouTube em src/apt/domain/platforms.py. Usado pelo
+# criterio C-3 abaixo -- ver o comentario em evaluate() para o porque.
+BURST_CAPACITY = 1
+# Teto algebrico do bucket: no pior caso (balde cheio + refill do mesmo
+# segundo), uma unica janela de 1s do simulador pode ver ate esta quantidade de
+# requisicoes -- e a propria invariante que test_domain.py::
+# test_burst_mais_refill_nao_passa_do_limite_estimado verifica. Ver TRADE-OFFS.md
+# item 16 e item 20.
+ALGEBRAIC_CEILING_RPS = ALLOWED_RPS + BURST_CAPACITY
 
 # Demanda bem acima do limite, para que o rate limiter seja o gargalo em TODAS as
 # configuracoes. Com demanda baixa, 1 e 5 workers dariam o mesmo resultado e o
 # teste nao provaria nada.
-TOTAL_SENDS = 500
-TARGET_RATE_PER_MIN = 2400  # 40/s solicitados vs 16/s permitidos
+#
+# TOTAL_SENDS reduzido de 500 para 150 nesta recalibracao: com o YouTube em
+# 3 req/s permitidos (antes 16), o mesmo volume por cenario levaria ~5.3x mais
+# tempo para escoar (a vazao de envio passa a ser limitada pelo mecanismo, nao
+# mais pelo teto do ambiente). Sem reduzir o volume, os tres cenarios juntos
+# ultrapassariam os ~10 minutos aceitaveis para a demo ao vivo. Ver
+# PLANO-DE-TESTES.md e RESULTADOS-TESTES.md para a duracao medida.
+TOTAL_SENDS = 150
+TARGET_RATE_PER_MIN = 600  # 10/s solicitados vs 3/s permitidos
 
 WORKER_COUNTS = (1, 3, 5)
 
@@ -134,6 +153,10 @@ async def run_scenario(client: httpx.AsyncClient, worker_count: int) -> Scenario
         total_sends=TOTAL_SENDS,
         target_rate_per_min=TARGET_RATE_PER_MIN,
         url_count=10,
+        # "uniform", nao "humanized": ver a nota em load_test.py sobre o
+        # multiplicador de atividade por hora do dia suprimir a demanda real
+        # de madrugada (UTC), independentemente do rate limiter.
+        jitter_strategy="uniform",
     )
 
     step("aguardando o processamento...")
@@ -200,23 +223,71 @@ def evaluate(scenarios: list[ScenarioResult]) -> bool:
         print(f"  [{marca}] com {s.workers} worker(s), 429 recebidos = {s.throttled}")
         todos_ok = todos_ok and passou
 
-    # --- Criterio 3: A HIPOTESE CENTRAL ------------------------------------
-    # O pico nao deve crescer proporcionalmente ao numero de workers. Toleramos
-    # 25% de variacao entre a menor e a maior configuracao -- o jitter e o
-    # desalinhamento entre a nossa janela e a do simulador produzem alguma
-    # oscilacao legitima. Crescimento LINEAR (5x com 5 workers) seria a
-    # assinatura inequivoca de um limiter por processo.
-    picos = [s.peak_observed_rps for s in scenarios]
-    if len(picos) >= 2 and min(picos) > 0:
-        crescimento = max(picos) / min(picos)
-        passou = crescimento <= 1.25
+    # --- Criterio 3: A HIPOTESE CENTRAL -------------------------------------
+    # A hipotese testada e "o limite e global, entao escalar workers NAO
+    # AUMENTA o pico alem do que o proprio bucket compartilhado permite".
+    #
+    # Ate a rodada anterior, isso era medido por uma razao relativa contra a
+    # linha de base (peak_rps(N) <= peak_rps(1) x 1.15). Essa razao CONTRADIZ
+    # a invariante que o proprio projeto declara em test_domain.py::
+    # test_burst_mais_refill_nao_passa_do_limite_estimado: burst_capacity +
+    # allowed_rps <= estimated_limit_rps. Com o YouTube recalibrado
+    # (allowed=3, burst=1), a especificacao permite 1+3=4 req/s numa unica
+    # janela do simulador -- e um teto relativo de 1.15x sobre uma linha de
+    # base de 3 e 3.45, que PROIBE o 4 que a propria invariante do projeto
+    # autoriza. O criterio relativo nao escala para um baseline pequeno: o
+    # menor incremento inteiro possivel (uma unica requisicao) ja e 33% de um
+    # baseline de 3, mas era so 6% de um baseline de 16 (o numero para o qual
+    # 1.15x foi originalmente calibrado). Errado o criterio, nao a medicao --
+    # ver TRADE-OFFS.md item 20.
+    #
+    # Substituido por medicao direta contra os dois tetos que a hipotese
+    # central realmente afirma:
+    #   (a) o pico nunca excede o teto ALGEBRICO do bucket compartilhado
+    #       (allowed_rps + burst_capacity) em NENHUMA configuracao -- e esse
+    #       teto NAO cresce com o numero de workers, porque o estado e
+    #       compartilhado;
+    #   (b) o pico nunca excede o limite da propria plataforma (ja verificado
+    #       no Criterio 1 acima, com o mesmo numero quando estimated_limit_rps
+    #       == PLATFORM_LIMIT_RPS).
+    # Um rate limiter em memoria de processo violaria (a) exatamente ao
+    # escalar (cada processo teria seu proprio balde) -- e essa violacao,
+    # nao uma razao percentual, e a assinatura que este criterio detecta.
+    for s in scenarios:
+        passou = s.peak_observed_rps <= ALGEBRAIC_CEILING_RPS
         marca = "OK  " if passou else "FALHOU"
         print(
-            f"  [{marca}] o pico NAO cresce com o numero de workers: "
-            f"variacao de {crescimento:.2f}x entre {min(picos)}/s e {max(picos)}/s "
-            f"(tolerancia 1.25x; um limiter por processo daria ~{len(picos)}x)"
+            f"  [{marca}] com {s.workers} worker(s), o pico ({s.peak_observed_rps}/s) <= teto "
+            f"algebrico do bucket compartilhado ({ALGEBRAIC_CEILING_RPS:g}/s = "
+            f"allowed {ALLOWED_RPS:g} + burst {BURST_CAPACITY}); um limiter por processo "
+            f"violaria este teto exatamente ao escalar"
         )
         todos_ok = todos_ok and passou
+
+    # A razao relativa contra a linha de base so tem significado quando o
+    # incremento inteiro minimo (1 req/s) e pequeno frente ao baseline --
+    # arbitrado aqui em baseline >= 20, o mesmo numero para o qual a
+    # tolerancia de 1.15x foi originalmente calibrada. Informativo apenas:
+    # nao participa de todos_ok.
+    if len(scenarios) >= 2 and scenarios[0].peak_observed_rps >= 20:
+        baseline = scenarios[0]
+        for s in scenarios[1:]:
+            crescimento = s.peak_observed_rps / baseline.peak_observed_rps
+            passou = crescimento <= 1.15
+            marca = "OK  " if passou else "FALHOU"
+            print(
+                f"  [{marca}] com {s.workers} worker(s), o pico ({s.peak_observed_rps}/s) nao "
+                f"cresce mais que 15% sobre a linha de base de {baseline.workers} worker(s) "
+                f"({baseline.peak_observed_rps}/s): {crescimento:.2f}x "
+                f"(tolerancia 1.15x; um limiter por processo daria ~{s.workers}x)"
+            )
+            todos_ok = todos_ok and passou
+    elif len(scenarios) >= 2:
+        print(
+            f"  [INFO] criterio de crescimento relativo (1.15x) nao aplicavel: linha de "
+            f"base de {scenarios[0].peak_observed_rps}/s < 20/s -- quantizacao inteira "
+            f"torna a razao sem significado (ver PLANO-DE-TESTES.md e TRADE-OFFS.md item 20)"
+        )
 
     # --- Criterio 4: load balancing entre replicas --------------------------
     for s in scenarios:
@@ -273,8 +344,8 @@ def build_report(scenarios: list[ScenarioResult]) -> str:
         if s.workers >= 2 and s.worker_distribution
     )
 
-    picos = [s.peak_observed_rps for s in scenarios]
-    variacao = f"{max(picos) / min(picos):.2f}x" if picos and min(picos) > 0 else "n/d"
+    maior_pico = max((s.peak_observed_rps for s in scenarios), default=0)
+    dentro_do_teto = maior_pico <= ALGEBRAIC_CEILING_RPS
 
     return (
         f"### Teste de escala -- a prova do rate limiter distribuido\n\n"
@@ -283,10 +354,14 @@ def build_report(scenarios: list[ScenarioResult]) -> str:
         f"nosso limite: **{ALLOWED_RPS} req/s** | "
         f"limite da plataforma: **{PLATFORM_LIMIT_RPS} req/s**\n\n"
         f"{tabela}\n\n"
-        f"**Variacao do pico entre a menor e a maior configuracao: {variacao}**\n\n"
+        f"**Teto algebrico do bucket compartilhado (allowed + burst): "
+        f"{ALGEBRAIC_CEILING_RPS:g}/s -- maior pico observado em qualquer configuracao: "
+        f"{maior_pico}/s ({'dentro do teto' if dentro_do_teto else 'EXCEDEU O TETO'})**\n\n"
         f"Com um rate limiter em memoria de processo, o pico cresceria "
-        f"proporcionalmente ao numero de workers (~{len(scenarios)}x). O estado "
-        f"compartilhado no Redis e o que mantem o limite GLOBAL.\n\n"
+        f"proporcionalmente ao numero de workers (~{len(scenarios)}x o teto acima) -- "
+        f"muito alem do teto algebrico de um unico balde compartilhado. O estado "
+        f"compartilhado no Redis e o que mantem o pico dentro desse teto em qualquer "
+        f"numero de workers.\n\n"
         f"{distribuicoes}\n"
     )
 

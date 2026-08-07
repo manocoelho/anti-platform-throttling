@@ -43,6 +43,38 @@ async def client() -> AsyncIterator[httpx.AsyncClient]:
     await dispose_engine()
 
 
+@pytest.fixture(autouse=True)
+async def _no_active_campaign_leak() -> AsyncIterator[None]:
+    """Garante que nenhuma campanha fique `active` apos o teste.
+
+    O `client` deste modulo roda a app SEM lifespan (ver docstring do modulo)
+    de proposito, para o dispatcher IN-PROCESSO nao mexer nas contagens. Mas
+    isso nao isola o teste do dispatcher do container `api` do compose, que ja
+    esta rodando e aponta para o MESMO Postgres: uma campanha ativada aqui e
+    materializada e publicada de verdade por aquele processo, indefinidamente,
+    ate alguem pausa-la. Sem esta limpeza, um teste que ativa uma campanha e
+    nao a pausa contamina as filas compartilhadas para o resto da sessao --
+    foi o que produziu falhas intermitentes em
+    `test_retry_volta_para_a_fila_original`, com um `task_id` de uma campanha
+    de teste alheia aparecendo onde so deveria estar a mensagem publicada por
+    aquele teste.
+    """
+    yield
+    from sqlalchemy import text
+
+    from apt.db.engine import connection, dispose_engine
+
+    async with connection() as conn:
+        await conn.execute(text("UPDATE campaigns SET status = 'paused' WHERE status = 'active'"))
+    # O `client` fixture ja dispensa o engine no teardown dele, mas esta
+    # limpeza roda DEPOIS (autouse sem dependencia de `client` não garante
+    # ordem) e recria um engine novo preso ao event loop deste teste. Sem
+    # dispensar de novo aqui, o proximo teste (event loop novo) herdaria um
+    # engine morto e todo o resto do modulo passaria a dar skip por "Postgres
+    # indisponivel".
+    await dispose_engine()
+
+
 def campaign_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "name": "Campanha de teste",

@@ -17,6 +17,7 @@ from apt.resilience.breaker_state import (
     BreakerSnapshot,
     evaluate_allow,
     evaluate_failure,
+    evaluate_release,
     evaluate_success,
 )
 
@@ -169,6 +170,36 @@ class TestHalfOpen:
         assert transition == (BreakerState.HALF_OPEN, BreakerState.OPEN)
         assert snapshot.opened_at_ms == reopen_at
         assert snapshot.success_count == 0
+
+    def test_release_devolve_a_sonda_que_nao_foi_enviada(self, now_ms: int) -> None:
+        """Uma sonda admitida e adiada por uma camada seguinte nao vaza.
+
+        Sem `evaluate_release`, uma sonda admitida em half_open mas desviada
+        pelo rate limiter antes do envio nunca chama `evaluate_success` nem
+        `evaluate_failure` -- o slot fica ocupado para sempre. Apos
+        `half_open_probes` vazamentos como este, nenhuma sonda nova e
+        admitida e o circuito trava em half_open (era exatamente o
+        comportamento antes desta correcao). `release` devolve o slot sem
+        contar como sucesso nem como falha.
+        """
+        snapshot = BreakerSnapshot(
+            state=BreakerState.HALF_OPEN, opened_at_ms=now_ms, probes_in_flight=1
+        )
+        released = evaluate_release(snapshot)
+        assert released.probes_in_flight == 0
+        assert released.state is BreakerState.HALF_OPEN
+        assert released.failure_count == snapshot.failure_count
+        assert released.success_count == snapshot.success_count
+
+        # O slot devolvido fica disponivel para uma nova sonda.
+        decision = evaluate_allow(released, config=CONFIG, now_ms=now_ms)
+        assert decision.allowed is True
+        assert decision.snapshot.probes_in_flight == 1
+
+    def test_release_em_closed_e_no_op(self, now_ms: int) -> None:
+        """Fora de half_open nao ha slot de sonda para devolver."""
+        snapshot = BreakerSnapshot(state=BreakerState.CLOSED, failure_count=2)
+        assert evaluate_release(snapshot) == snapshot
 
 
 class TestCicloCompleto:
