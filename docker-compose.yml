@@ -1,0 +1,210 @@
+# ---------------------------------------------------------------------------
+# Orquestracao local do Anti-Platform Throttling.
+#
+# Sete servicos:
+#   postgres      - persistencia (campanhas, tarefas, execucoes, falhas)
+#   redis         - estado distribuido (token buckets, circuit breaker, flags)
+#   rabbitmq      - broker (topic + fanout + DLX/DLQ + filas de retry com TTL)
+#   api           - FastAPI: CRUD de campanhas + scheduler como background task
+#   worker        - consome a fila e aplica as politicas de resiliencia (escalavel)
+#   platform-sim  - simula YouTube e Instagram, com 429 real e injecao de falhas
+#   prometheus    - coleta as metricas dos tres processos Python
+#
+# DUAS DECISOES DESTE ARQUIVO QUE MERECEM EXPLICACAO
+#
+# 1. `image: apt-app:local` nos tres servicos Python.
+#    Os tres compartilham o mesmo Dockerfile. Sem o `image:` explicito, o
+#    Compose trataria cada servico como uma imagem distinta e construiria a
+#    MESMA coisa TRES VEZES. Com o mesmo nome de imagem, ele constroi uma vez e
+#    os tres reaproveitam.
+#
+# 2. Healthchecks em Python, nao com `curl`.
+#    `curl` nao esta na imagem (ver o cabecalho de docker/Dockerfile: removemos
+#    o apt-get para nao depender dos repositorios Debian no build). O Python ja
+#    esta la, e `urllib.request` faz o mesmo trabalho.
+#
+# Todo servico de infraestrutura tem healthcheck, e os servicos de aplicacao
+# usam `condition: service_healthy`. Sem isso, a API sobe antes do Postgres
+# aceitar conexao -- foi exatamente o que aconteceu na primeira versao.
+# ---------------------------------------------------------------------------
+
+name: apt
+
+services:
+  # =========================================================================
+  # Infraestrutura
+  # =========================================================================
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-apt}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-apt_local_password}
+      POSTGRES_DB: ${POSTGRES_DB:-apt}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Os arquivos em /docker-entrypoint-initdb.d rodam em ordem alfabetica na
+      # PRIMEIRA inicializacao do volume. E o nosso mecanismo de migracao:
+      # simples e suficiente para a POC -- com a limitacao de que alterar o
+      # schema exige `down -v` (ver ADR-012 e docs/TRADE-OFFS.md).
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-apt} -d ${POSTGRES_DB:-apt}"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    # appendonly garante que os buckets sobrevivem a um restart do Redis. Nao e
+    # critico (o bucket se reconstroi cheio), mas evita liberar uma rajada
+    # inteira logo apos o restart.
+    command: ["redis-server", "--appendonly", "yes", "--save", ""]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-apt}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-apt_local_password}
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # painel de gerenciamento (util na demo)
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  # =========================================================================
+  # Aplicacao -- os tres compartilham a imagem `apt-app:local`
+  # =========================================================================
+  api:
+    image: apt-app:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command:
+      - uvicorn
+      - apt.api.main:app
+      - --host=0.0.0.0
+      - --port=8000
+    env_file: [.env]
+    environment:
+      APT_SERVICE_NAME: api
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # /health/live e deliberadamente trivial: NAO checa dependencias. Se
+      # checasse, uma queda de 30s do Postgres faria o Docker reiniciar o
+      # container -- que voltaria e falharia de novo, porque o problema nunca
+      # esteve nele. Ver src/apt/api/routers/health.py.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live', timeout=3)
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  worker:
+    image: apt-app:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command: ["python", "-m", "apt.worker.main"]
+    env_file: [.env]
+    environment:
+      APT_SERVICE_NAME: worker
+      APT_METRICS_PORT: "9100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      platform-sim:
+        condition: service_healthy
+    # Sem `ports:` de proposito -- assim `--scale worker=5` funciona sem
+    # conflito de porta no host. O Prometheus encontra as replicas pelo DNS
+    # interno do Compose (ver prometheus/prometheus.yml).
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:9100/metrics', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  platform-sim:
+    image: apt-app:local
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    command:
+      - uvicorn
+      - apt.platform_sim.main:app
+      - --host=0.0.0.0
+      - --port=9001
+    env_file: [.env]
+    environment:
+      APT_SERVICE_NAME: platform-sim
+    ports:
+      - "9001:9001"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:9001/health', timeout=3)
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # =========================================================================
+  # Observabilidade
+  # =========================================================================
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  redis_data:
+  rabbitmq_data:
