@@ -18,6 +18,7 @@ from apt.messaging.topology import (
     declare_control_queue,
     declare_topology,
     retry_queue_name,
+    retry_routing_key,
     task_queue_name,
 )
 
@@ -37,5 +38,6 @@ __all__ = [
     "get_publisher",
     "read_header_int",
     "retry_queue_name",
+    "retry_routing_key",
     "task_queue_name",
 ]

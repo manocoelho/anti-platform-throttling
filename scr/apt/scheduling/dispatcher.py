@@ -26,8 +26,9 @@ desacelerar, as tarefas acumulam na fila em vez de estourar em erro.
 
 CONSISTENCIA: A ORDEM ENTRE BANCO E FILA
 
-Gravamos no banco ANTES de publicar. A ordem importa e as duas falhas possiveis
-sao assimetricas:
+Gravamos no banco ANTES de publicar -- e, desde a correcao abaixo, so publicamos
+DEPOIS que a transacao do tick TERMINOU DE COMMITAR, nao apenas depois do INSERT
+dentro dela. As duas falhas possiveis continuam assimetricas:
 
     banco primeiro, publish falha
         -> existe uma linha em `send_tasks` com status `pending` que nunca sera
@@ -41,6 +42,26 @@ sao assimetricas:
 Preferimos a primeira: registro visivel sem envio e melhor que envio sem
 registro. A solucao definitiva seria o padrao Transactional Outbox, que ficou
 fora do escopo -- decisao registrada em docs/TRADE-OFFS.md.
+
+BUG REAL, CORRIGIDO: PUBLICAR DENTRO DA TRANSACAO ABERTA
+
+Ate esta correcao, `_dispatch_campaign` chamava `publish_task()` para cada
+tarefa DENTRO do `async with connection()` do tick inteiro -- que so commita
+depois de processar TODAS as campanhas (ate 20) e publicar todas as
+mensagens. Com `dispatch_max_batch=200`, um tick materializa e publica ate 200
+mensagens antes de a transacao commitar. Um worker local, rapido o
+suficiente, podia consumir a PRIMEIRA mensagem publicada e tentar
+`INSERT INTO executions` (com FK para `send_tasks`) ANTES do commit que criou
+a linha correspondente -- `asyncpg.exceptions.ForeignKeyViolationError`. O
+handler nao tratado faz `consumer.py` mandar a mensagem para a DLQ sem
+requeue, mesmo quando o envio ja tinha sido aceito pela plataforma (o erro
+acontecia depois do envio, ao registrar o resultado). Reproduzido de forma
+isolada, fora deste projeto de teste especifico: uma campanha de 400 envios,
+sem nenhum truncate/purge por perto, produziu ~14% de `ForeignKeyViolationError`.
+
+A correcao: os `SendTaskMessage` sao coletados durante o loop e SO publicados
+depois que o `async with connection()` do tick sai do bloco (ou seja, depois
+do commit). Ver `tick()`.
 """
 
 from __future__ import annotations
@@ -131,20 +152,30 @@ class Dispatcher:
 
         jitter_enabled = await self._flags.is_enabled(Flag.JITTER_ENABLED)
         total_published = 0
+        to_publish: list[SendTaskMessage] = []
 
         # Uma transacao por tick. As campanhas reservadas ficam travadas apenas
         # durante ela -- milissegundos -- e o commit no fim garante que contador
-        # e tarefas sao gravados juntos.
+        # e tarefas sao gravados juntos. As mensagens NAO sao publicadas aqui
+        # dentro -- ver o comentario "BUG REAL, CORRIGIDO" no docstring do modulo.
         async with connection() as conn:
             campaigns = await CampaignRepository.claim_active_for_dispatch(conn, limit=20)
             if not campaigns:
                 return 0
 
             for campaign in campaigns:
-                published = await self._dispatch_campaign(
+                published, messages = await self._dispatch_campaign(
                     conn, campaign, jitter_enabled=jitter_enabled
                 )
                 total_published += published
+                to_publish.extend(messages)
+
+        # So publicamos DEPOIS que a transacao acima terminou de commitar. Antes
+        # desta linha, todas as linhas de `send_tasks` deste tick ja estao
+        # visiveis para qualquer outra conexao -- inclusive a do worker que vai
+        # consumir estas mensagens.
+        for message in to_publish:
+            await self._publisher.publish_task(message)
 
         if total_published:
             logger.info(
@@ -158,15 +189,20 @@ class Dispatcher:
 
     async def _dispatch_campaign(
         self, conn: Any, campaign: dict[str, Any], *, jitter_enabled: bool
-    ) -> int:
-        """Materializa e publica as tarefas de uma campanha neste tick."""
+    ) -> tuple[int, list[SendTaskMessage]]:
+        """Materializa as tarefas de uma campanha neste tick.
+
+        NAO publica -- devolve as mensagens para o chamador (`tick()`) publicar
+        depois que a transacao do tick tiver commitado. Ver o comentario "BUG
+        REAL, CORRIGIDO" no docstring do modulo.
+        """
         campaign_id = UUID(str(campaign["id"]))
         platform = Platform(str(campaign["platform"]))
         strategy = JitterStrategy(str(campaign["jitter_strategy"]))
 
         remaining = int(campaign["total_sends"]) - int(campaign["dispatched_count"])
         if remaining <= 0:
-            return 0
+            return 0, []
 
         now = utcnow()
         plan = plan_tick(
@@ -180,9 +216,9 @@ class Dispatcher:
             rng=self._rng,
         )
         if plan.count == 0:
-            return 0
+            return 0, []
 
-        published = 0
+        messages: list[SendTaskMessage] = []
         for offset_ms in plan.offsets_ms:
             # Cada tarefa recebe o proprio id de correlacao. Isso permite seguir
             # um envio especifico pelos logs da API e de todos os workers -- sem
@@ -204,7 +240,8 @@ class Dispatcher:
 
             scheduled_at = now + timedelta(milliseconds=offset_ms)
 
-            # 1) grava a intencao (ver nota sobre a ordem no docstring do modulo)
+            # Grava a intencao (ver nota sobre a ordem no docstring do modulo).
+            # A publicacao acontece so depois do commit -- em tick().
             task_id = await TaskRepository.create(
                 conn,
                 campaign_id=campaign_id,
@@ -215,22 +252,21 @@ class Dispatcher:
                 correlation_id=correlation_id,
             )
 
-            # 2) publica
-            message = SendTaskMessage(
-                task_id=str(task_id),
-                campaign_id=str(campaign_id),
-                content_id=str(content["id"]),
-                platform=platform,
-                content_url=str(content["content_url"]),
-                correlation_id=correlation_id,
-                scheduled_at=scheduled_at.isoformat(),
-                attempt=0,
+            messages.append(
+                SendTaskMessage(
+                    task_id=str(task_id),
+                    campaign_id=str(campaign_id),
+                    content_id=str(content["id"]),
+                    platform=platform,
+                    content_url=str(content["content_url"]),
+                    correlation_id=correlation_id,
+                    scheduled_at=scheduled_at.isoformat(),
+                    attempt=0,
+                )
             )
-            await self._publisher.publish_task(message)
-
             metrics.tasks_dispatched.labels(platform=str(platform)).inc()
-            published += 1
 
+        published = len(messages)
         if published:
             await CampaignRepository.register_dispatch(conn, campaign_id, published)
 
@@ -243,7 +279,7 @@ class Dispatcher:
             published=published,
             mean_interval_ms=round(plan.mean_interval_ms, 1),
         )
-        return published
+        return published, messages
 
     @property
     def ticks(self) -> int:

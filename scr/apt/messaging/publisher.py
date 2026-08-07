@@ -30,6 +30,7 @@ from apt.messaging.topology import (
     RETRY_TIERS_MS,
     Topology,
     declare_topology,
+    retry_routing_key,
 )
 
 logger = get_logger(__name__)
@@ -110,6 +111,7 @@ class Publisher:
         """
         topology = self._require_topology()
         clamped = max(1, min(tier, len(RETRY_TIERS_MS)))
+        platform_str = str(message.platform)
 
         await topology.retry.publish(
             self._build_message(
@@ -121,11 +123,11 @@ class Publisher:
                     "x-apt-attempt": message.attempt,
                 },
             ),
-            # A routing key aqui seleciona a FILA DE ESPERA. Quando o TTL
-            # expira, o RabbitMQ preserva esta chave ao mandar para o
-            # apt.tasks... por isso a fila de retry NAO define
-            # x-dead-letter-routing-key -- ver comentario em topology.py.
-            routing_key=f"tier.{clamped}",
+            # A routing key aqui seleciona a FILA DE ESPERA desta plataforma.
+            # Ao expirar o TTL, a fila de retry manda a mensagem para
+            # apt.tasks com x-dead-letter-routing-key = a propria plataforma
+            # (declarado em topology.py, nao mais "preservado" da entrada).
+            routing_key=retry_routing_key(platform_str, clamped),
         )
         logger.info(
             "publisher.retry_scheduled",

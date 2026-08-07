@@ -17,10 +17,14 @@ idempotentes, quem chegar primeiro cria e o outro apenas confirma.
                                         v
                                     apt.dlq  <- inspecionavel pela API
 
-    apt.retry (topic)  -- tres filas com TTL, cada uma devolvendo a mensagem
-      |-- apt.retry.1  (TTL   1s)  --> volta para apt.tasks
-      |-- apt.retry.2  (TTL   5s)  --> volta para apt.tasks
-      |-- apt.retry.3  (TTL  30s)  --> volta para apt.tasks
+    apt.retry (topic)  -- uma fila de TTL por PLATAFORMA x DEGRAU, cada uma
+    devolvendo a mensagem para a fila da propria plataforma:
+      |-- apt.retry.youtube.1    (TTL  1s)  --> apt.tasks.youtube
+      |-- apt.retry.youtube.2    (TTL  5s)  --> apt.tasks.youtube
+      |-- apt.retry.youtube.3    (TTL 30s)  --> apt.tasks.youtube
+      |-- apt.retry.instagram.1  (TTL  1s)  --> apt.tasks.instagram
+      |-- apt.retry.instagram.2  (TTL  5s)  --> apt.tasks.instagram
+      |-- apt.retry.instagram.3  (TTL 30s)  --> apt.tasks.instagram
 
     apt.control (fanout)
       |-- fila exclusiva por worker --> todos recebem toda mensagem
@@ -49,8 +53,26 @@ CABECA da fila. Uma mensagem com TTL de 30s publicada antes de outra com TTL de
 
 Com tres filas de TTL fixo, toda mensagem numa fila tem o mesmo prazo, e a
 ordem FIFO coincide com a ordem de expiracao. O jitter continua existindo -- ele
-e aplicado na ESCOLHA da fila e no `apt.retry.1` para adiamentos curtos (ver
+e aplicado na ESCOLHA da fila e na fila de tier 1 para adiamentos curtos (ver
 `resilience/retry.py`). Ver docs/TRADE-OFFS.md.
+
+POR QUE UMA FILA POR PLATAFORMA x DEGRAU, E NAO SO POR DEGRAU
+
+Ate a correcao do TRADE-OFFS.md item 14, existiam 3 filas de retry (uma por
+degrau), compartilhadas entre todas as plataformas. Isso era o bug: a routing
+key que o RabbitMQ preserva ao dead-letter e a que a mensagem tinha ao ENTRAR
+na fila de retry -- `tier.N` -- nao a plataforma que ela tinha antes de
+`publish_retry` a republicar. Como `apt.tasks` so tem binding para
+`youtube`/`instagram`, nao para `tier.N`, toda mensagem que expirava na fila de
+retry chegava inroteavel e era descartada em silencio.
+
+A correcao segrega por plataforma: `apt.retry.<plataforma>.<degrau>`, com
+`x-dead-letter-routing-key` explicito. A routing key deixa de ser algo a
+"preservar" -- e declarada de proposito, exatamente como a fila de tarefas.
+Efeito colateral positivo: o retry passa a ser isolado por plataforma tambem na
+fila de espera, reforcando o Bulkhead numa camada que antes nao o tinha (um
+retry do Instagram nao compete mais pela mesma fila do que um retry do
+YouTube).
 """
 
 from __future__ import annotations
@@ -89,9 +111,19 @@ def task_queue_name(platform: str) -> str:
     return f"apt.tasks.{platform}"
 
 
-def retry_queue_name(tier: int) -> str:
-    """Nome da fila de retry do degrau `tier` (1-indexado)."""
-    return f"apt.retry.{tier}"
+def retry_queue_name(platform: str, tier: int) -> str:
+    """Nome da fila de retry do degrau `tier` (1-indexado) de uma plataforma.
+
+    Uma fila por plataforma x degrau -- nao so por degrau -- e o que permite
+    `x-dead-letter-routing-key` apontar para a plataforma certa. Ver a secao
+    "POR QUE UMA FILA POR PLATAFORMA x DEGRAU" no docstring do modulo.
+    """
+    return f"apt.retry.{platform}.{tier}"
+
+
+def retry_routing_key(platform: str, tier: int) -> str:
+    """Routing key da fila de retry do degrau `tier` de uma plataforma."""
+    return f"tier.{tier}.{platform}"
 
 
 @dataclass(slots=True)
@@ -108,7 +140,9 @@ class Topology:
     retry: AbstractExchange
     task_queues: dict[str, AbstractQueue]
     dlq: AbstractQueue
-    retry_queues: dict[int, AbstractQueue]
+    # Chave (plataforma, degrau) -- uma fila por combinacao, ver
+    # "POR QUE UMA FILA POR PLATAFORMA x DEGRAU" no docstring do modulo.
+    retry_queues: dict[tuple[str, int], AbstractQueue]
 
 
 async def declare_topology(channel: AbstractChannel) -> Topology:
@@ -163,27 +197,36 @@ async def declare_topology(channel: AbstractChannel) -> Topology:
         task_queues[str(platform)] = queue
 
     # --- Filas de retry (o tempo passa dentro do broker) -------------------
-    retry_queues: dict[int, AbstractQueue] = {}
-    for index, ttl_ms in enumerate(RETRY_TIERS_MS, start=1):
-        name = retry_queue_name(index)
-        queue = await channel.declare_queue(
-            name,
-            durable=True,
-            arguments={
-                "x-message-ttl": ttl_ms,
-                # Expirado o TTL, a mensagem vai para o DLX desta fila -- que
-                # aqui e o exchange de TAREFAS, nao o de mensagens mortas.
-                # E o que faz a mensagem voltar ao fluxo normal.
-                "x-dead-letter-exchange": EXCHANGE_TASKS,
-                # Sem `x-dead-letter-routing-key`: assim o RabbitMQ preserva a
-                # routing key original da mensagem, que e a plataforma. Fixar
-                # uma chave aqui mandaria todo retry para a fila errada.
-                "x-max-length": 50_000,
-                "x-overflow": "drop-head",
-            },
-        )
-        await queue.bind(retry, routing_key=f"tier.{index}")
-        retry_queues[index] = queue
+    # Uma fila por PLATAFORMA x DEGRAU -- ver "POR QUE UMA FILA POR PLATAFORMA
+    # x DEGRAU" no docstring do modulo. `x-dead-letter-routing-key` explicito
+    # e o que corrige o bug documentado no TRADE-OFFS.md item 14: sem ele, o
+    # RabbitMQ preservaria a routing key que a mensagem tinha ao ENTRAR na
+    # fila de retry ("tier.N.<plataforma>", usada so para rotear ATE aqui),
+    # que nao tem binding nenhum em `apt.tasks`.
+    retry_queues: dict[tuple[str, int], AbstractQueue] = {}
+    for platform in all_platforms():
+        platform_str = str(platform)
+        for index, ttl_ms in enumerate(RETRY_TIERS_MS, start=1):
+            name = retry_queue_name(platform_str, index)
+            queue = await channel.declare_queue(
+                name,
+                durable=True,
+                arguments={
+                    "x-message-ttl": ttl_ms,
+                    # Expirado o TTL, a mensagem vai para o DLX desta fila --
+                    # que aqui e o exchange de TAREFAS, nao o de mensagens
+                    # mortas. E o que faz a mensagem voltar ao fluxo normal.
+                    "x-dead-letter-exchange": EXCHANGE_TASKS,
+                    # A routing key de destino e declarada, nao "preservada":
+                    # sempre a plataforma desta fila, entregando exatamente em
+                    # apt.tasks.<plataforma>.
+                    "x-dead-letter-routing-key": platform_str,
+                    "x-max-length": 50_000,
+                    "x-overflow": "drop-head",
+                },
+            )
+            await queue.bind(retry, routing_key=retry_routing_key(platform_str, index))
+            retry_queues[(platform_str, index)] = queue
 
     logger.info(
         "messaging.topology_declared",
