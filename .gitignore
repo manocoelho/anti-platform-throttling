@@ -1,7 +1,28 @@
-venv/
-env/
-.env
+# Python
 __pycache__/
-*.pyc
-*.sqlite3
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Ferramentas
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ambiente (segredos nunca versionados - use .env.example como referencia)
+.env
+
+# Saida dos testes de carga (os resultados consolidados vao para docs/)
+tests/load/output/
+
+# Editores / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
