@@ -196,6 +196,12 @@ class Worker:
 
         try:
             # --- Camada 3: circuit breaker (1 ida ao Redis) ---------------
+            # `breaker_admitted_probe` registra se ESTA chamada admitiu uma
+            # sonda de half_open. Se uma camada seguinte adiar a tarefa antes
+            # do envio, o slot da sonda precisa ser devolvido explicitamente
+            # (ver Camada 4) -- senao ele vaza, porque nem record_success nem
+            # record_failure chegam a ser chamados (TRADE-OFFS.md item 15).
+            breaker_admitted_probe = False
             if breaker_on:
                 decision = await self._breaker.allow(platform)
                 await self._persist_transition(decision, platform, reason="allow")
@@ -208,6 +214,7 @@ class Worker:
                     )
                     await raw.ack()
                     return
+                breaker_admitted_probe = decision.state is BreakerState.HALF_OPEN
 
             # --- Camada 4: rate limiter (2 idas ao Redis) -----------------
             if limiter_on:
@@ -218,6 +225,11 @@ class Worker:
                     limited_by=rl.limited_by or "none",
                 ).inc()
                 if not rl.allowed:
+                    if breaker_admitted_probe:
+                        # A sonda foi admitida mas o envio nao aconteceu --
+                        # devolve o slot, senao ele vaza e o circuito trava em
+                        # half_open permanentemente.
+                        await self._breaker.release_probe(platform)
                     await self._defer(
                         message,
                         outcome=Outcome.RATE_LIMITED_LOCAL,

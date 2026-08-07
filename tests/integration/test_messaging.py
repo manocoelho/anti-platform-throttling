@@ -4,10 +4,10 @@ Dois comportamentos merecem verificacao contra o RabbitMQ real, porque dependem
 de detalhes do broker que nao daria para simular com confianca:
 
 1. A FILA DE RETRY DEVOLVE A MENSAGEM PARA A FILA CORRETA. A mensagem vai para
-   `apt.retry.1` com routing key `tier.1`, espera o TTL e volta para
-   `apt.tasks` -- preservando a routing key ORIGINAL (a plataforma). Isso so
-   funciona porque a fila de retry NAO define `x-dead-letter-routing-key`; se
-   definisse, todo retry cairia na fila errada.
+   `apt.retry.youtube.1` com routing key `tier.1.youtube`, espera o TTL e volta
+   para `apt.tasks` com `x-dead-letter-routing-key=youtube` -- declarado, nao
+   "preservado" (ver TRADE-OFFS.md item 14 para a versao anterior, que
+   preservava `tier.1.youtube` em vez da plataforma e perdia a mensagem).
 
 2. O FANOUT ENTREGA A TODAS AS FILAS. E a razao de o exchange de controle ser
    fanout e nao topic: uma invalidacao de feature flag precisa chegar a todos os
@@ -101,10 +101,24 @@ class TestTopologia:
         assert task_queue_name("youtube") in {q.name for q in topology.task_queues.values()}
         assert task_queue_name("instagram") in {q.name for q in topology.task_queues.values()}
 
-    async def test_tres_degraus_de_retry(self, channel: AbstractRobustChannel) -> None:
+    async def test_tres_degraus_de_retry_por_plataforma(
+        self, channel: AbstractRobustChannel
+    ) -> None:
+        """Uma fila por plataforma x degrau -- nao uma so por degrau.
+
+        E o que permite `x-dead-letter-routing-key` apontar para a plataforma
+        certa (ver TRADE-OFFS.md item 14).
+        """
         topology = await declare_topology(channel)
-        assert set(topology.retry_queues) == {1, 2, 3}
-        assert topology.retry_queues[1].name == retry_queue_name(1)
+        assert set(topology.retry_queues) == {
+            ("youtube", 1),
+            ("youtube", 2),
+            ("youtube", 3),
+            ("instagram", 1),
+            ("instagram", 2),
+            ("instagram", 3),
+        }
+        assert topology.retry_queues[("youtube", 1)].name == retry_queue_name("youtube", 1)
 
     async def test_dlq_declarada(self, channel: AbstractRobustChannel) -> None:
         topology = await declare_topology(channel)
@@ -167,27 +181,24 @@ class TestRetryComTTL:
 
         ESTE E O TESTE QUE VERIFICA O MECANISMO DE BACKOFF SEM BLOQUEAR WORKER.
 
-        O caminho completo: publish em `apt.retry` com routing key `tier.1` ->
-        fila `apt.retry.1` (TTL 1s, sem consumidor) -> TTL expira -> o RabbitMQ
-        manda para o DLX daquela fila, que e `apt.tasks` -> a routing key ORIGINAL
-        (`youtube`) e preservada -> a mensagem cai em `apt.tasks.youtube`.
-
-        A preservacao da routing key so acontece porque a fila de retry NAO define
-        `x-dead-letter-routing-key`. Se definisse, todo retry iria para a fila
-        errada -- e o bug seria silencioso: as mensagens circulariam sem nunca
-        chegar ao consumidor certo.
+        O caminho completo: publish em `apt.retry` com routing key
+        `tier.1.youtube` -> fila `apt.retry.youtube.1` (TTL 1s, sem
+        consumidor) -> TTL expira -> o RabbitMQ manda para o DLX daquela fila,
+        que e `apt.tasks`, com `x-dead-letter-routing-key=youtube` (declarado
+        na fila, nao preservado da entrada) -> a mensagem cai em
+        `apt.tasks.youtube`.
         """
         topology = await declare_topology(channel)
         task_queue = topology.task_queues[str(Platform.YOUTUBE)]
         await task_queue.purge()
-        await topology.retry_queues[1].purge()
+        await topology.retry_queues[("youtube", 1)].purge()
 
         message = build_message(attempt=1)
         await publisher.publish_retry(message, tier=1, reason="throttled")
 
         # Imediatamente apos publicar, a mensagem esta na fila de ESPERA.
         assert await asyncio.wait_for(
-            self._wait_for_message_count(topology.retry_queues[1], expected=1),
+            self._wait_for_message_count(topology.retry_queues[("youtube", 1)], expected=1),
             timeout=5.0,
         )
 
@@ -212,39 +223,73 @@ class TestRetryComTTL:
         payload corrompido.
         """
         topology = await declare_topology(channel)
-        await topology.retry_queues[3].purge()
+        await topology.retry_queues[("youtube", 3)].purge()
 
         await publisher.publish_retry(build_message(), tier=99, reason="teste")
         assert await asyncio.wait_for(
-            self._wait_for_message_count(topology.retry_queues[3], expected=1),
+            self._wait_for_message_count(topology.retry_queues[("youtube", 3)], expected=1),
             timeout=5.0,
         )
 
     @staticmethod
     async def _wait_for_message_count(queue: object, *, expected: int) -> bool:
-        """Espera a fila declarar `expected` mensagens."""
-        for _ in range(50):
-            declared = await queue.channel.declare_queue(  # type: ignore[attr-defined]
-                queue.name,
-                passive=True,  # type: ignore[attr-defined]
-            )
-            if declared.declaration_result.message_count >= expected:
-                return True
-            await asyncio.sleep(0.1)
-        return False
+        """Espera a fila declarar `expected` mensagens.
+
+        Consulta por um canal NOVO, nao pelo `queue.channel` que fez a
+        declaracao original -- reusar esse canal faz o aio_pika devolver a
+        contagem em cache do momento da declaracao (aqui, sempre 0, porque o
+        `purge()` roda logo depois), nunca a contagem real vigente no
+        servidor. Bug confirmado no cliente (aio_pika/aiormq), nao no
+        RabbitMQ: `rabbitmqctl list_queues` e a API de management sempre
+        mostraram a contagem correta no mesmo instante em que esta consulta,
+        pelo canal antigo, insistia em devolver zero.
+        """
+        connection = await aio_pika.connect_robust(get_settings().rabbitmq_url)
+        try:
+            channel = await connection.channel()
+            for _ in range(50):
+                declared = await channel.declare_queue(
+                    queue.name,  # type: ignore[attr-defined]
+                    passive=True,
+                )
+                if declared.declaration_result.message_count >= expected:
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+        finally:
+            await connection.close()
 
     @staticmethod
     async def _poll_queue(queue: object, *, timeout_seconds: float) -> object | None:
-        """Tenta consumir da fila repetidamente ate o timeout."""
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout_seconds
-        while loop.time() < deadline:
-            try:
-                return await queue.get(no_ack=True, fail=False)  # type: ignore[attr-defined]
-            except Exception:
-                pass
-            await asyncio.sleep(0.2)
-        return None
+        """Tenta consumir da fila repetidamente ate o timeout.
+
+        Mesmo motivo do canal novo em `_wait_for_message_count`: `queue` foi
+        obtida do canal que declarou e purgou a fila originalmente, e
+        reusar esse canal faz `get()` nunca encontrar a mensagem -- mesmo
+        com ela genuinamente presente no servidor (confirmado via
+        `rabbitmqctl`). Um canal novo, numa fila redeclarada passivamente,
+        nao tem esse problema.
+        """
+        connection = await aio_pika.connect_robust(get_settings().rabbitmq_url)
+        try:
+            channel = await connection.channel()
+            fresh_queue = await channel.declare_queue(
+                queue.name,  # type: ignore[attr-defined]
+                passive=True,
+            )
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_seconds
+            while loop.time() < deadline:
+                try:
+                    message = await fresh_queue.get(no_ack=True, fail=False)
+                    if message is not None:
+                        return message
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
+            return None
+        finally:
+            await connection.close()
 
 
 class TestFanoutDeControle:

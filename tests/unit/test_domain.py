@@ -158,16 +158,24 @@ class TestPlatformProfiles:
         for profile in PLATFORM_PROFILES.values():
             assert profile.safety_margin >= 0.10
 
-    def test_burst_nao_passa_do_limite_estimado(self) -> None:
-        """Uma rajada nao pode, sozinha, estourar o limite da plataforma.
+    def test_burst_mais_refill_nao_passa_do_limite_estimado(self) -> None:
+        """Rajada + refill do mesmo segundo, juntos, nao podem estourar o limite.
 
-        Se `burst_capacity` fosse maior que `estimated_limit_rps`, o bucket cheio
-        liberaria de uma vez mais requisicoes do que a plataforma aceita num
-        segundo -- e receberiamos 429 no primeiro envio apos um periodo de
-        inatividade.
+        A versao anterior deste teste verificava so `burst_capacity <=
+        estimated_limit_rps` (16 <= 20, passava) e era INSUFICIENTE: ela ignora
+        que, no pior caso, o bucket cheio libera `burst_capacity` requisicoes
+        E o refill do mesmo segundo libera mais `allowed_rps` -- tudo dentro da
+        MESMA janela de 1s que o simulador usa para decidir o 429
+        (`PlatformThrottle`, janela deslizante de 1s). Com os valores antigos
+        (burst=16, allowed_rps=16, limite=20): 16+16=32 > 20 -- o pior caso
+        estourava o limite por construcao, nao por desalinhamento de relogio.
+        Foi exatamente isso que produziu 429 reais na primeira execucao dos
+        testes de carga com o rate limiter ligado (ver RESULTADOS-TESTES.md).
+
+        A invariante correta soma os dois:
         """
         for profile in PLATFORM_PROFILES.values():
-            assert profile.burst_capacity <= profile.estimated_limit_rps
+            assert profile.burst_capacity + profile.allowed_rps <= profile.estimated_limit_rps
 
     def test_plataformas_tem_limites_assimetricos(self) -> None:
         """A assimetria e proposital: e o que torna o bulkhead observavel.

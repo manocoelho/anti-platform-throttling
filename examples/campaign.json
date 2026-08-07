@@ -1,0 +1,13 @@
+{
+  "name": "Demo - lancamento institucional",
+  "platform": "youtube",
+  "total_sends": 60,
+  "target_rate_per_min": 300,
+  "jitter_strategy": "uniform",
+  "contents": [
+    { "url": "https://youtube.com/watch?v=demo-principal", "weight": 3 },
+    { "url": "https://youtube.com/watch?v=demo-secundario", "weight": 2 },
+    { "url": "https://youtube.com/watch?v=demo-teaser", "weight": 1 }
+  ],
+  "activate": true
+}
